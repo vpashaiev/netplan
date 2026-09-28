@@ -94,6 +94,33 @@ class PCIDevice(object):
         return os.path.exists(self.subpath("sriov_numvfs"))
 
     @property
+    def has_sriov_drivers_autoprobe(self) -> bool:
+        """Determine if device supports sriov_drivers_autoprobe control
+        :return: whether sriov_drivers_autoprobe exists
+        :rtype: bool
+        """
+        return os.path.exists(self.subpath("sriov_drivers_autoprobe"))
+
+    def set_sriov_drivers_autoprobe(self, enabled: bool) -> bool:
+        """Enable or disable automatic driver probing for new VFs
+        :param enabled: whether to enable autoprobe
+        :type: bool
+        :return: whether the operation succeeded
+        :rtype: bool
+        """
+        if not self.has_sriov_drivers_autoprobe:
+            return False
+        try:
+            with open(self.subpath("sriov_drivers_autoprobe"), "w") as f:
+                f.write("1" if enabled else "0")
+            return True
+        except IOError as e:
+            logging.warning(
+                f"Failed setting sriov_drivers_autoprobe to {enabled} for {self.pci_addr}: {str(e)}"
+            )
+            return False
+
+    @property
     def is_vf(self) -> bool:
         """Determine if device is a SR-IOV Virtual Function
         :return: whether device is a VF
@@ -332,7 +359,7 @@ def _get_virtual_functions(np_state: netplan.State) -> Set[str]:
     return vfs
 
 
-def set_numvfs_for_pf(pf, vf_count):
+def set_numvfs_for_pf(pf, vf_count, autoprobe: Optional[bool] = None):
     """
     Allocate the required number of VFs for the selected PF.
     """
@@ -354,6 +381,14 @@ def set_numvfs_for_pf(pf, vf_count):
     if vf_count > vf_max:
         raise ConfigurationError(
             'cannot allocate more VFs for PF %s than supported: %s > %s (sriov_totalvfs)' % (pf, vf_count, vf_max))
+
+    if autoprobe is not None:
+        try:
+            pci_addr = _get_pci_slot_name(pf)
+            pcidev = PCIDevice(pci_addr)
+            pcidev.set_sriov_drivers_autoprobe(autoprobe)
+        except Exception as e:
+            logging.warning('failed setting sriov_drivers_autoprobe to %s for %s: %s' % (autoprobe, pf, str(e)))
 
     try:
         with open(numvfs_path, 'w') as f:
@@ -465,6 +500,7 @@ def apply_sriov_config(config_manager, rootdir='/'):
     # interface that they're currently matching to
     vfs_set = _get_virtual_functions(np_state)
     pfs = _get_physical_functions(np_state)
+    pf_to_netdef = {iface: np_state[nid] for nid, iface in pfs.items()}
 
     # setup the required number of VFs per PF
     # at the same time store which PFs got changed in case the NICs
@@ -472,7 +508,16 @@ def apply_sriov_config(config_manager, rootdir='/'):
     vf_count_changed = []
     if vf_counts:
         for pf, vf_count in vf_counts.items():
-            if not set_numvfs_for_pf(pf, vf_count):
+            # If the PF is configured for switchdev mode, disable VF driver
+            # autoprobe before creating VFs to prevent the kernel from attaching
+            # drivers in legacy mode and overloading the firmware command mailbox
+            # during subsequent eswitch mode transition (LP: #2166228).
+            netdef = pf_to_netdef.get(pf)
+            if netdef and netdef._embedded_switch_mode == 'switchdev':
+                res = set_numvfs_for_pf(pf, vf_count, autoprobe=False)
+            else:
+                res = set_numvfs_for_pf(pf, vf_count)
+            if not res:
                 continue
 
             vf_count_changed.append(pf)
@@ -482,32 +527,6 @@ def apply_sriov_config(config_manager, rootdir='/'):
         # number of enabled VFs
         for pf in vf_count_changed:
             perform_hardware_specific_quirks(pf)
-
-        # also, since the VF number changed, the interfaces list also
-        # changed, so we need to refresh it
-        interfaces = utils.get_interfaces()
-
-    # now in theory we should have all the new VFs set up and existing;
-    # this is needed because we will have to now match the defined VF
-    # entries to existing interfaces, otherwise we won't be able to set
-    # filtered VLANs for those.
-    # XXX: does matching those even make sense?
-    vfs = {}
-    for vf in vfs_set:
-        netdef = np_state[vf]
-        if netdef._has_match:
-            # right now we only match by name, as I don't think matching per
-            # driver and/or macaddress makes sense
-            # TODO: print warning if other matches are provided
-
-            for interface in interfaces:
-                if netdef._match_interface(iface_name=interface):
-                    if vf in vfs and vfs[vf]:
-                        raise ConfigurationError('matched more than one interface for a VF device: %s' % vf)
-                    vfs[vf] = interface
-        else:
-            if vf in interfaces:
-                vfs[vf] = vf
 
     # Walk the SR-IOV PFs and check if we need to change the eswitch mode
     for netdef_id, iface in pfs.items():
@@ -532,6 +551,30 @@ def apply_sriov_config(config_manager, rootdir='/'):
                     if pcidev.vfs:
                         if not netdef._delay_virtual_functions_rebind:
                             bind_vfs(pcidev.vfs, pcidev.driver)
+            elif pcidev.vfs and not netdef._delay_virtual_functions_rebind:
+                bind_vfs(pcidev.vfs, pcidev.driver)
+
+    # Refresh the list of network interfaces now that VFs have been created,
+    # mode transition is complete, and VFs are bound to their driver
+    interfaces = utils.get_interfaces()
+
+    # match the defined VF entries to existing interfaces for VLAN filtering
+    vfs = {}
+    for vf in vfs_set:
+        netdef = np_state[vf]
+        if netdef._has_match:
+            # right now we only match by name, as I don't think matching per
+            # driver and/or macaddress makes sense
+            # TODO: print warning if other matches are provided
+
+            for interface in interfaces:
+                if netdef._match_interface(iface_name=interface):
+                    if vf in vfs and vfs[vf]:
+                        raise ConfigurationError('matched more than one interface for a VF device: %s' % vf)
+                    vfs[vf] = interface
+        else:
+            if vf in interfaces:
+                vfs[vf] = vf
 
     filtered_vlans_set = set()
     for vlan, netdef in np_state.vlans.items():

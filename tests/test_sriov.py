@@ -578,6 +578,59 @@ class TestSRIOV(unittest.TestCase):
             self.assertIn('failed setting sriov_numvfs to 2 for enp1',
                           str(e.exception))
 
+    @patch('netplan_cli.cli.sriov.PCIDevice.set_sriov_drivers_autoprobe')
+    @patch('netplan_cli.cli.sriov._get_pci_slot_name')
+    def test_set_numvfs_for_pf_autoprobe_disabled(self, mock_slot, mock_autoprobe):
+        mock_slot.return_value = '0000:03:00.0'
+        sriov_open = MockSRIOVOpen()
+        sriov_open.read_queue = ['8\n']
+
+        with patch('builtins.open', sriov_open.open):
+            ret = sriov.set_numvfs_for_pf('enp1', 2, autoprobe=False)
+
+        self.assertTrue(ret)
+        mock_slot.assert_called_once_with('enp1')
+        mock_autoprobe.assert_called_once_with(False)
+        self.assertListEqual(sriov_open.open.call_args_list,
+                             [call('/sys/class/net/enp1/device/sriov_totalvfs'),
+                              call('/sys/class/net/enp1/device/sriov_numvfs', 'w')])
+        handle = sriov_open.open()
+        handle.write.assert_called_once_with('2')
+
+    @patch('netplan_cli.cli.sriov.PCIDevice.set_sriov_drivers_autoprobe')
+    @patch('netplan_cli.cli.sriov._get_pci_slot_name')
+    def test_set_numvfs_for_pf_autoprobe_enabled(self, mock_slot, mock_autoprobe):
+        mock_slot.return_value = '0000:03:00.0'
+        sriov_open = MockSRIOVOpen()
+        sriov_open.read_queue = ['8\n']
+
+        with patch('builtins.open', sriov_open.open):
+            ret = sriov.set_numvfs_for_pf('enp1', 2, autoprobe=True)
+
+        self.assertTrue(ret)
+        mock_slot.assert_called_once_with('enp1')
+        mock_autoprobe.assert_called_once_with(True)
+        self.assertListEqual(sriov_open.open.call_args_list,
+                             [call('/sys/class/net/enp1/device/sriov_totalvfs'),
+                              call('/sys/class/net/enp1/device/sriov_numvfs', 'w')])
+        handle = sriov_open.open()
+        handle.write.assert_called_once_with('2')
+
+    @patch('netplan_cli.cli.sriov._get_pci_slot_name')
+    def test_set_numvfs_for_pf_autoprobe_error(self, mock_slot):
+        mock_slot.side_effect = RuntimeError('pci slot error')
+        sriov_open = MockSRIOVOpen()
+        sriov_open.read_queue = ['8\n']
+
+        with patch('builtins.open', sriov_open.open):
+            with self.assertLogs(level='WARNING') as logs:
+                ret = sriov.set_numvfs_for_pf('enp1', 2, autoprobe=False)
+
+        self.assertTrue(ret)
+        self.assertIn('failed setting sriov_drivers_autoprobe to False for enp1', logs.output[0])
+        handle = sriov_open.open()
+        handle.write.assert_called_once_with('2')
+
     def test_perform_hardware_specific_quirks(self):
         # for now we have no custom quirks defined, so we just
         # check if the function succeeds
@@ -917,6 +970,21 @@ MODALIAS=pci:v00008086d0000156Fsv000017AAsd00002245bc02sc00i00
             self.assertTrue(pcidev.bound)
             open(os.path.join(self.workdir.name, 'sys_mock/bus/pci/devices/0000:00:1f.6/physfn'), 'a').close()
             self.assertTrue(pcidev.is_vf)
+            self.assertFalse(pcidev.has_sriov_drivers_autoprobe)
+            self.assertFalse(pcidev.set_sriov_drivers_autoprobe(False))
+            autoprobe_file = os.path.join(self.workdir.name, 'sys_mock/bus/pci/devices/0000:00:1f.6/sriov_drivers_autoprobe')
+            open(autoprobe_file, 'a').close()
+            self.assertTrue(pcidev.has_sriov_drivers_autoprobe)
+            self.assertTrue(pcidev.set_sriov_drivers_autoprobe(False))
+            with open(autoprobe_file) as f:
+                self.assertEqual(f.read().strip(), '0')
+            self.assertTrue(pcidev.set_sriov_drivers_autoprobe(True))
+            with open(autoprobe_file) as f:
+                self.assertEqual(f.read().strip(), '1')
+            with patch('builtins.open', side_effect=IOError('write error')):
+                with self.assertLogs(level='WARNING') as logs:
+                    self.assertFalse(pcidev.set_sriov_drivers_autoprobe(False))
+                    self.assertIn('Failed setting sriov_drivers_autoprobe to False', logs.output[0])
 
     @patch('netplan_cli.cli.utils.get_interface_macaddress')
     @patch('netplan_cli.cli.utils.get_interfaces')
@@ -1019,6 +1087,40 @@ MODALIAS=pci:v00008086d0000156Fsv000017AAsd00002245bc02sc00i00
             call(['/sbin/devlink', 'dev', 'eswitch', 'set', 'pci/0000:03:00.0', 'mode', 'legacy']),
             call(['/sbin/devlink', 'dev', 'eswitch', 'set', 'pci/0000:03:00.1', 'mode', 'switchdev'])
         ])
+        self.assertEqual(set_numvfs.call_args_list, [
+            call('enp1', 2),
+            call('enp2', 1, autoprobe=False),
+        ])
+
+    @patch('netplan_cli.cli.sriov._get_physical_functions')
+    @patch('netplan_cli.cli.sriov.set_numvfs_for_pf')
+    @patch('netplan_cli.cli.sriov.perform_hardware_specific_quirks')
+    @patch('netplan_cli.cli.sriov.bind_vfs')
+    @patch('netplan_cli.cli.sriov.PCIDevice.sys', new_callable=unittest.mock.PropertyMock)
+    @patch('netplan_cli.cli.sriov.PCIDevice.devlink_eswitch_mode')
+    @patch('netplan_cli.cli.sriov._get_pci_slot_name')
+    def test_apply_sriov_config_eswitch_mode_already_active(self, gpsn, pcidevice_devlink, pcidevice_sys,
+                                                            mock_bind_vfs, quirks, set_numvfs, get_phys):
+        self._prepare_sysfs_dir_structure(pf=('enp1', '0000:03:00.0'),
+                                          vfs=[('enp1s16f1', '0000:03:00.2')],
+                                          pf_driver='mlx5_core')
+        gpsn.return_value = '0000:03:00.0'
+        pcidevice_sys.return_value = os.path.join(self.workdir.name, 'sys')
+        pcidevice_devlink.return_value = 'switchdev'
+        get_phys.return_value = {'enp1': 'enp1'}
+        set_numvfs.return_value = True
+
+        with open(os.path.join(self.workdir.name, 'etc/netplan/test.yaml'), 'w') as fd:
+            print('''network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    enp1:
+      embedded-switch-mode: switchdev
+''', file=fd)
+
+        sriov.apply_sriov_config(self.configmanager, rootdir=self.workdir.name)
+        mock_bind_vfs.assert_called_once()
 
     @patch('netplan_cli.cli.sriov.unbind_vfs')
     @patch('netplan_cli.cli.utils.get_interface_macaddress')
@@ -1359,6 +1461,50 @@ MODALIAS=pci:v00008086d0000156Fsv000017AAsd00002245bc02sc00i00
         self.assertEqual(pcidev.devlink_eswitch_mode(), '__undetermined')
         check_output_mock.assert_has_calls([
             call(['/sbin/devlink', '-j', 'dev', 'eswitch', 'show', 'pci/0000:03:00.0'], stderr=-3),
+        ])
+
+    @patch('netplan_cli.cli.sriov._get_pci_slot_name')
+    @patch('netplan_cli.cli.sriov._get_vf_number_per_pf')
+    @patch('netplan_cli.cli.sriov._get_virtual_functions')
+    @patch('netplan_cli.cli.sriov._get_physical_functions')
+    @patch('netplan_cli.cli.sriov.set_numvfs_for_pf')
+    @patch('netplan_cli.cli.sriov.perform_hardware_specific_quirks')
+    @patch('netplan_cli.cli.utils.get_interface_driver_name')
+    @patch('netplan_cli.cli.utils.get_interface_macaddress')
+    @patch('netplan_cli.cli.utils.get_interfaces')
+    def test_apply_sriov_config_autoprobe_switchdev(self, netifs, gim, gidn, quirks,
+                                                    set_numvfs, get_phys, get_virt, get_num, gpsn):
+        with open(os.path.join(self.workdir.name, "etc/netplan/test.yaml"), 'w') as fd:
+            print('''network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    enp1:
+      embedded-switch-mode: "switchdev"
+    enp2:
+      delay-virtual-functions-rebind: true
+    enp3:
+      mtu: 1500
+    enp1s16f1:
+      link: enp1
+    enp2s16f1:
+      link: enp2
+    enp3s16f1:
+      link: enp3
+''', file=fd)
+        netifs.return_value = ['enp1', 'enp2', 'enp3', 'enp1s16f1', 'enp2s16f1', 'enp3s16f1']
+        get_num.return_value = {'enp1': 1, 'enp2': 1, 'enp3': 1}
+        get_virt.return_value = {'enp1s16f1': None, 'enp2s16f1': None, 'enp3s16f1': None}
+        get_phys.return_value = {'enp1': 'enp1', 'enp2': 'enp2', 'enp3': 'enp3'}
+        gpsn.return_value = ''
+        set_numvfs.return_value = True
+
+        sriov.apply_sriov_config(self.configmanager, rootdir=self.workdir.name)
+
+        self.assertEqual(set_numvfs.call_args_list, [
+            call('enp1', 1, autoprobe=False),
+            call('enp2', 1),
+            call('enp3', 1),
         ])
 
 
