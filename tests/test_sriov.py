@@ -16,6 +16,7 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+import errno
 from io import StringIO
 import os
 import subprocess
@@ -1553,6 +1554,62 @@ MODALIAS=pci:v00008086d0000156Fsv000017AAsd00002245bc02sc00i00
         sriov.apply_sriov_config(self.configmanager, rootdir=self.workdir.name)
 
         netifs.assert_not_called()
+
+    @patch('os.path.exists')
+    def test_bind_vfs_success(self, mock_exists):
+        vf = sriov.PCIDevice('0000:03:00.2')
+        mock_exists.return_value = False
+        m_open = mock_open()
+        with patch('builtins.open', m_open):
+            res = sriov.bind_vfs([vf], 'mlx5_core')
+        self.assertEqual(res, [vf])
+        m_open.assert_called_once_with('/sys/bus/pci/drivers/mlx5_core/bind', 'wt')
+        m_open().write.assert_called_once_with('0000:03:00.2')
+
+    @patch('os.path.exists')
+    def test_bind_vfs_already_bound(self, mock_exists):
+        vf = sriov.PCIDevice('0000:03:00.2')
+        mock_exists.return_value = True
+        m_open = mock_open()
+        with patch('builtins.open', m_open):
+            res = sriov.bind_vfs([vf], 'mlx5_core')
+        self.assertEqual(res, [])
+        m_open.assert_not_called()
+
+    @patch('os.path.exists')
+    def test_bind_vfs_enodev_drivers_probe_fallback(self, mock_exists):
+        vf = sriov.PCIDevice('0000:03:00.2')
+
+        mock_exists.side_effect = lambda path: path == '/sys/bus/pci/drivers_probe'
+
+        handle = mock_open()
+        m_open = mock_open()
+        m_open.side_effect = [OSError(errno.ENODEV, 'No such device'), handle.return_value]
+
+        with patch('builtins.open', m_open):
+            res = sriov.bind_vfs([vf], 'mlx5_core')
+        self.assertEqual(res, [vf])
+        self.assertEqual(m_open.call_args_list, [
+            call('/sys/bus/pci/drivers/mlx5_core/bind', 'wt'),
+            call('/sys/bus/pci/drivers_probe', 'wt')
+        ])
+        handle().write.assert_called_once_with('0000:03:00.2')
+
+    @patch('os.path.exists')
+    def test_bind_vfs_enodev_no_drivers_probe_raises(self, mock_exists):
+        vf = sriov.PCIDevice('0000:03:00.2')
+        mock_exists.return_value = False
+        with patch('builtins.open', side_effect=OSError(errno.ENODEV, 'No such device')):
+            with self.assertRaises(OSError):
+                sriov.bind_vfs([vf], 'mlx5_core')
+
+    @patch('os.path.exists')
+    def test_bind_vfs_other_error_raises(self, mock_exists):
+        vf = sriov.PCIDevice('0000:03:00.2')
+        mock_exists.return_value = False
+        with patch('builtins.open', side_effect=OSError(errno.EACCES, 'Permission denied')):
+            with self.assertRaises(OSError):
+                sriov.bind_vfs([vf], 'mlx5_core')
 
 
 class TestParser(TestBase):

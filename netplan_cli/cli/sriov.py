@@ -16,6 +16,7 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+import errno
 import json
 import logging
 import os
@@ -238,11 +239,27 @@ class PCIDevice(object):
 def bind_vfs(vfs: typing.Iterable[PCIDevice], driver):
     """Bind unbound VFs to driver."""
     bound_vfs = []
+    bind_path = "/sys/bus/pci/drivers/{}/bind".format(driver)
+    drivers_probe = "/sys/bus/pci/drivers_probe"
     for vf in vfs:
         if not vf.bound:
-            with open("/sys/bus/pci/drivers/{}/bind".format(driver), "wt") as f:
-                f.write(vf.pci_addr)
-                bound_vfs.append(vf)
+            try:
+                with open(bind_path, "wt") as f:
+                    f.write(vf.pci_addr)
+                    bound_vfs.append(vf)
+            except OSError as e:
+                # When VFs are created with sriov_drivers_autoprobe=0, the kernel
+                # initializes them with match_driver=0. In this state, writing to
+                # /sys/bus/pci/drivers/<drv>/bind fails with ENODEV (-19) because
+                # pci_bus_match() rejects devices with match_driver==0.
+                # Writing to /sys/bus/pci/drivers_probe overcomes match_driver==0
+                # and triggers driver probe.
+                if e.errno == errno.ENODEV and os.path.exists(drivers_probe):
+                    with open(drivers_probe, "wt") as f:
+                        f.write(vf.pci_addr)
+                    bound_vfs.append(vf)
+                    continue
+                raise
     return bound_vfs
 
 
